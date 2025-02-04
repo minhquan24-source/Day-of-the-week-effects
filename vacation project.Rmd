@@ -1,0 +1,1975 @@
+Load neccessary library
+
+```{r}
+# Load library
+library(ggplot2)
+library(dplyr)
+library(rstan)
+library(forecast)
+library(splines)
+library(patchwork)
+library(reshape2)
+library(tibble)
+library(stats)
+library(reshape2)
+library(zoo)
+library(viridis)
+```
+
+
+
+```{r}
+data1 = read.csv(file = "/Users/minhquan/Desktop/Vacation Project/ukhsa-chart-download.csv")
+data2 = read.csv(file = "/Users/minhquan/Desktop/Vacation Project/ukhsa-covid-data2.csv")
+
+data1$in_reporting_delay_period <- as.character(data1$in_reporting_delay_period)
+
+
+
+
+
+```
+
+```{r}
+data2
+```
+
+
+```{r}
+# Filter the data for the specified date range and area_name, then select the required columns
+data2 <- data2 %>%
+  filter(
+    date >= as.Date("2023-06-01") & date <= as.Date("2023-12-31") 
+  ) %>%
+  select(date, metric_value)
+
+# Combine data2 and data1
+data <- bind_rows(data2, data1)
+
+# Remove unnecesary column
+data <- data[, !colnames(data) %in% c("geography_type","in_reporting_delay_period","theme","sub_theme","topic","geography","metric","sex","age","stratum","year")]
+data <- data %>%
+  arrange(date)
+data$date = as.Date(data$date)
+
+```
+
+
+```{r}
+data
+```
+
+
+Plot the number of cases
+
+```{r}
+# Compute the 7-day moving average
+data <- data %>%
+  arrange(date) %>%
+  mutate(moving_average = rollmean(metric_value, k = 7, fill = NA))
+
+# Define the highlight period (June to November) as a single rectangle
+highlight_period <- data.frame(
+  start = as.Date("2024-06-01"),
+  end = as.Date("2024-11-30"),
+  fill_color = "blue"  # Single color for the highlight
+)
+
+# Plot the moving average with the highlight period
+ggplot(data, aes(x = date, y = moving_average)) +
+  # Add rectangle for the highlight period
+  geom_rect(
+    data = highlight_period,
+    aes(
+      xmin = start, xmax = end,
+      ymin = -Inf, ymax = Inf,
+      fill = fill_color
+    ),
+    inherit.aes = FALSE,
+    alpha = 0.3  # Transparency for the rectangle
+  ) +
+  # Plot the moving average line
+  geom_line(size = 1, color = "black") +
+  scale_x_date(
+    date_labels = "%b %Y",  # Format the x-axis as Month/Year
+    date_breaks = "1 month"  # Break the x-axis into monthly intervals
+  ) +
+  scale_fill_identity() +  # Use the fill color defined in the data frame
+  labs(
+    title = "7-Day Moving Average with Highlighted Period",
+    x = "Date",
+    y = "Number of Cases (Average)"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 18),
+    axis.text.y = element_text(size = 18),
+    axis.title = element_text(size = 18),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+
+
+
+
+
+
+```{r}
+mean(data$metric_value)
+var(data$metric_value)
+# var > mean => negative binomial
+```
+
+Deseasonalise the data based on the day of the week + graph of the mean of the number of cases each day in a week
+
+```{r}
+
+# Add a column for the day of the week
+data$date <- as.Date(data$date, format = "%d/%m/%Y")
+data$DOW <- weekdays(data$date)
+# Summarize average cases by day of the week
+cases_by_DOW <- data %>%
+  group_by(DOW) %>%
+  summarise(
+    mean_cases = mean(metric_value, na.rm = TRUE),
+    median_cases = median(metric_value, na.rm = TRUE),
+    total_cases = sum(metric_value, na.rm = TRUE)
+  )
+
+# Reorder by days of the week
+cases_by_DOW$DOW <- factor(cases_by_DOW$DOW,
+                           levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"))
+# Reorder the 'DOW' column from Monday to Sunday
+data$DOW <- factor(data$DOW, 
+                   levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"))
+
+# Bar chart for average cases of each day in a week
+ggplot(cases_by_DOW, aes(x = DOW, y = mean_cases)) +
+  geom_bar(stat = "identity", fill = "skyblue", width = 0.6) +
+  labs(
+    title = "Average COVID-19 Cases by Day of the Week",
+    x = "Day of the Week",
+    y = "Average Cases"
+  ) +
+  scale_y_continuous(limits = c(0,700)) +
+  theme_minimal()
+
+# Boxplot for each day of the week
+ggplot(data, aes(x = DOW, y = metric_value)) +
+  geom_boxplot(fill = "lightblue") +
+  labs(
+    title = "Box plot of COVID-19 Cases by Day of the Week",
+    x = "Day of the Week",
+    y = "COVID-19 Cases"
+  ) +
+  theme_minimal()
+```
+
+ANOVA to test the difference of each day in a week
+
+```{r}
+# ANOVA to test the differences between the mean of each group
+anova_result <- aov(metric_value ~ DOW, data = data)
+# View ANOVA table
+summary(anova_result)
+
+```
+
+Encode DOW
+
+```{r}
+# Ensure DOW is encoded as integers (1 = Monday, 7 = Sunday)
+data$DOW <- as.numeric(factor(data$DOW, levels = c("Monday", "Tuesday", "Wednesday", 
+                                                   "Thursday", "Friday", "Saturday", "Sunday")))
+```
+
+
+Knot function to generate the number of knots for splined-based regression
+
+```{r}
+get_knots <- function (X, days_per_knot, spline_degree = 3) {
+  
+  X <- as.numeric(X)
+  
+  num_knots <- ceiling((max(X) - min(X)) / days_per_knot)
+  
+  first_knot <- min(X) - spline_degree * days_per_knot
+  final_knot <- first_knot + days_per_knot * num_knots +
+    2 * spline_degree * days_per_knot
+  
+  knots <- seq(first_knot, final_knot, by = days_per_knot)
+  
+  return(knots)
+}
+```
+
+
+
+Create a time index
+```{r}
+# Ensure the `date` column is in Date format
+data$date <- as.Date(data$date)
+
+# Create a time index
+data$time_index <- as.numeric(data$date) - min(as.numeric(data$date)) + 1
+
+# Order data by time index
+data <- data[order(data$time_index), ]
+```
+
+```{r}
+data
+```
+
+
+
+
+Overall model without DOW effect
+```{r}
+# Set some Stan settings
+rstan::rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+# Compile the Stan model
+ps_single_mod <- stan_model('/Users/minhquan/Desktop/Vacation Project/ps_single_final.stan')
+
+# Calculate the locations of equally spaced knots
+knots <- get_knots(data$time_index, days_per_knot = 5, spline_degree = 3)
+
+# Prepare data for Stan
+cov_data <- list(
+  num_data = nrow(data),
+  num_knots = length(knots),
+  knots = knots,
+  spline_degree = 3,
+  Y = data$metric_value,  
+  X = data$time_index,
+  week_effect = 1,
+  DOW = data$DOW
+)
+
+# Fit the model
+cov_fit <- sampling(
+  ps_single_mod,
+  iter = 5000,
+  warmup = 1000,
+  chains = 4,
+  data = cov_data
+)
+
+# Save the fitted model
+saveRDS(cov_fit, file = paste('fitted_stan_models/', 'cov_fit-overall_without_DOW.rds', sep = ""))
+
+```
+
+train overall model with DOW effect
+
+```{r}
+# Set some Stan settings
+rstan::rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+# Compile the Stan model
+ps_single_mod <- stan_model('/Users/minhquan/Desktop/Vacation Project/ps_single_final.stan')
+
+# Calculate the locations of equally spaced knots
+knots <- get_knots(data$time_index, days_per_knot = 5, spline_degree = 3)
+
+# Prepare data for Stan
+cov_data <- list(
+  num_data = nrow(data),
+  num_knots = length(knots),
+  knots = knots,
+  spline_degree = 3,
+  Y = data$metric_value,  
+  X = data$time_index,
+  week_effect = 7, # 7: all day of the week
+  DOW = data$DOW
+)
+
+# Fit the model
+cov_fit <- sampling(
+  ps_single_mod,
+  iter = 5000,
+  warmup = 1000,
+  chains = 4,
+  data = cov_data
+)
+
+# Save the fitted model
+saveRDS(cov_fit, file = paste('fitted_stan_models/', 'cov_fit-overall_with_DOW_all_day.rds', sep = ""))
+```
+```{r}
+# Overall model fit with the effect of day of the week
+source('/Users/minhquan/Desktop/Vacation Project/ps_single_analysis_scripts.R')
+
+```
+
+
+Plot the fitted curve with DOW effect
+```{r}
+# Overall model fit with the effect of day of the week
+source('/Users/minhquan/Desktop/Vacation Project/ps_single_analysis_scripts.R')
+
+# Load the trained Stan model
+cov_fit <- readRDS('fitted_stan_models/cov_fit-overall_with_DOW_all_day.rds')
+
+# Define parameters for the analysis
+X <- data$time_index        # Time index
+DOW <- data$DOW             # Day of the week (numeric)
+week_effect <- 7            # 7 for all days
+time_labels <- data$date    # Date labels for plotting
+days_per_knot <- 5          # Knot spacing for splines
+spline_degree <- 3          # Degree of splines
+
+# Call ps_single_incidence_dow
+incidence_dow_df <- ps_single_incidence_dow(
+  ps_fit = cov_fit,          # Trained Stan model
+  X = X,                     # Time index
+  DOW = DOW,                 # Day of the week
+  week_effect = week_effect, # Day-of-week effect
+  num_days = length(X),      # Number of days
+  time_labels = time_labels, # Labels for time (dates)
+  days_per_knot = days_per_knot,
+  spline_degree = spline_degree
+)
+
+# Add the predicted values (y_pred_with_dow) to the dataset
+data$y_pred_with_dow <- incidence_dow_df$y
+
+ggplot(incidence_dow_df, aes(x = time, y = y)) +
+  geom_line(color = "blue") +
+  geom_ribbon(aes(ymin = lb_95, ymax = ub_95), fill = "darkblue", alpha = 0.2) +
+
+  geom_point(data = data, aes(x = date, y = metric_value), color = "red", size = 0.3) +
+  labs(
+    title = "Actual vs Fitted Values with Day-of-Week All day Effect ",
+    x = "Date",
+    y = "Number of Cases"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+
+
+Fitted model without DOW effect (poster Figure 1)
+
+
+```{r}
+# Load the trained Stan model (no DOW effect)
+cov_fit <- readRDS('fitted_stan_models/cov_fit-overall_without_DOW.rds')
+
+# Define parameters for the analysis
+X <- data$time_index        # Time index
+time_labels <- data$date    # Date labels for plotting
+days_per_knot <- 5          # Knot spacing for splines
+spline_degree <- 3          # Degree of splines
+
+# Call ps_single_incidence (no DOW effect version)
+incidence_df <- ps_single_incidence(
+  ps_fit = cov_fit,          # Trained Stan model
+  X = X,                     # Time index
+  num_days = length(X),      # Number of days
+  time_labels = time_labels, # Labels for time (dates)
+  days_per_knot = days_per_knot,
+  spline_degree = spline_degree
+)
+
+
+
+# Create a one-row dataset for the rectangle
+rect_data <- data.frame(
+  xmin = as.Date("2024-6-01"),
+  xmax = as.Date("2024-12-01"),
+  ymin = 0,
+  ymax = 3500,
+  fill = "Analysis Period"
+)
+
+ggplot(incidence_df, aes(x = time, y = y)) +
+  # Highlight period using geom_rect() with rect_data
+  geom_rect(data = rect_data, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = fill),
+            alpha = 0.3, inherit.aes = FALSE) +  # Transparent highlight
+ 
+  # Connect actual data points
+  geom_line(data = data, aes(x = date, y = metric_value), color = "red", size = 0.5) +  
+  # Add the actual points
+  geom_point(data = data, aes(x = date, y = metric_value), color = "red", size = 0.5) +  
+  # Fitted values
+  scale_x_date(
+    date_breaks = "3 month",          # Set x-axis breaks to every 2 months
+    date_labels = "%b %Y",           # Format as "Month Year"
+    limits = as.Date(c("2023-06-01", "2025-01-31")), # Set start and end dates
+    expand = c(0, 0)                 # Remove white space at the start and end
+  ) +
+  scale_y_continuous(
+    limits = c(0, 3500),  # Set ymin = 0; ymax will be automatically determined
+    expand = c(0, 0)    # Remove padding around the y-axis
+  ) +
+  scale_fill_manual(
+    name = NULL,  # Remove "Legend" title
+    values = c("Analysis Period" = "orange"),
+    labels = c("Analysis Period" = "Analysis Period in Figure 4"),
+    guide = guide_legend(override.aes = list(alpha = 0.3))  # Match transparency in legend
+  ) +
+  labs(
+    title = "",
+    x = "",
+    y = "Number of Cases"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(size = 22, vjust = 0.5, hjust = 0.5),
+    axis.text.y = element_text(size = 24),
+    axis.title.x = element_text(size = 24),
+    axis.title.y = element_text(size = 24),
+    plot.title = element_text(size = 24, hjust = 0.5),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 24),
+    legend.position = c(0.05, 0.95),  # Legend inside the plot (top-left corner)
+    legend.justification = c(0, 1),   # Align legend box to the top-left corner
+    legend.key.size = unit(2, "cm"),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+    plot.background = element_rect(fill = "white", color = NA)
+  )
+
+
+
+# Save the plot as a PDF file (optional)
+ggsave(
+  filename = "fitted_curve_model_without_dow.pdf",  # File name
+  plot = last_plot(),                              # The last plot created
+  width = 15,                                      # Width in inches
+  height = 8                                       # Height in inches
+)
+
+```
+
+```{r}
+ggplot(incidence_df, aes(x = time, y = y)) +
+  # Highlight period using geom_rect() with rect_data
+  geom_rect(data = rect_data, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = fill),
+            alpha = 0.3, inherit.aes = FALSE) +  # Transparent highlight
+  # Add the blue line for overall model inference
+  geom_line(color = "blue", size = 1.8, aes(color = "Overall Model Inference")) +  
+  # Connect actual data points
+  geom_line(data = data, aes(x = date, y = metric_value), color = "red", size = 0.8) +  
+  # Add the actual points
+  geom_point(data = data, aes(x = date, y = metric_value), color = "red", size = 1) +  
+  scale_x_date(
+    date_breaks = "3 month",          # Set x-axis breaks to every 2 months
+    date_labels = "%b %Y",           # Format as "Month Year"
+    limits = as.Date(c("2023-06-01", "2025-01-31")), # Set start and end dates
+    expand = c(0, 0)                 # Remove white space at the start and end
+  ) +
+  scale_y_continuous(
+    limits = c(0, 3500),  # Set ymin = 0; ymax will be automatically determined
+    expand = c(0, 0)    # Remove padding around the y-axis
+  ) +
+  # Customize the legend
+  scale_fill_manual(
+    name = NULL,  # Remove "Legend" title
+    values = c("Analysis Period" = "orange"),
+    labels = c("Analysis Period" = "Analysis Period in Figure 4"),
+    guide = guide_legend(override.aes = list(alpha = 0.3))  # Match transparency in legend
+  ) +
+  labs(
+    title = "",
+    x = "",
+    y = "Number of Cases"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(size = 22, vjust = 0.5, hjust = 0.5),
+    axis.text.y = element_text(size = 24),
+    axis.title.x = element_text(size = 24),
+    axis.title.y = element_text(size = 24),
+    plot.title = element_text(size = 24, hjust = 0.5),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 24),
+    legend.position = c(0.05, 0.95),  # Legend inside the plot (top-left corner)
+    legend.justification = c(0, 1),   # Align legend box to the top-left corner
+    legend.key.size = unit(2, "cm"),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+    plot.background = element_rect(fill = "white", color = NA)
+  )
+
+```
+
+-----------------------------------------------------------------------------------------------------------------------------
+
+
+Model 1: without DOW + 365 days
+
+```{r}
+process_model_without_dow <- function(
+  max_date,
+  training_length = 365, 
+  base_dir = "/Users/minhquan/Desktop/Vacation Project/fitted_stan_models/without_DOW/",
+  days_per_knot = 5,
+  spline_degree = 3,
+  iter = 5000,
+  warmup = 1000,
+  chains = 4
+) {
+
+  # Calculate the min_date based on the training length
+  min_date <- max_date - training_length  
+  
+  # Subset the data for the current window
+  df_tmp <- data[data$date <= max_date & data$date > min_date, ]
+  
+  # Create a time index for the current window
+  df_tmp$time_index <- as.numeric(df_tmp$date) - min(as.numeric(df_tmp$date)) + 1
+  
+  # Calculate knots for splines
+  knots <- get_knots(df_tmp$time_index, days_per_knot = days_per_knot, spline_degree = spline_degree)
+  
+  # Prepare data for Stan
+  tmp_data <- list(
+    num_data = nrow(df_tmp),
+    num_knots = length(knots),
+    knots = knots,
+    spline_degree = spline_degree,
+    Y = df_tmp$metric_value,  
+    X = df_tmp$time_index,
+    week_effect = 1,  # Without DOW effect
+    DOW = df_tmp$DOW
+  )
+  
+  # Fit the model for the current window
+  tmp_fit <- sampling(
+    ps_single_mod,
+    iter = iter,
+    warmup = warmup,
+    chains = chains,
+    data = tmp_data
+  )
+  
+  # Save the fitted model and metadata
+  saveRDS(
+    tmp_fit,
+    file = paste0(base_dir, format(max_date, "%Y-%m-%d"), "-cov_fit.rds")
+  )
+  
+  cat(paste("Model for max_date", format(max_date, "%Y-%m-%d"), "processed and saved.\n"))
+}
+
+
+```
+
+
+Train real-time model without dow effect
+
+```{r}
+# Define the range of max_dates
+max_dates <- seq.Date(from = as.Date("2024-8-18"), to = as.Date("2024-8-18"), by = "day")
+
+# Loop through each max_date and run the function
+for (max_date in max_dates) {
+  max_date = as.Date(max_date)
+  process_model_without_dow(
+    max_date = max_date,
+    training_length = 365,  
+    base_dir = "/Users/minhquan/Desktop/Vacation Project/fitted_stan_models/without_DOW/"  
+  )
+}
+
+
+
+```
+
+Generate prediction for overall model without dow effect
+```{r}
+source('/Users/minhquan/Desktop/Vacation Project/ps_single_analysis_scripts.R')
+
+
+generate_sampled_predictions_overall_without_dow <- function(cov_fit_path, data, days_per_knot = 5, spline_degree = 3) {
+  # Load the trained Stan model
+  cov_fit <- readRDS(cov_fit_path)
+  
+  # Prepare required parameters
+  X <- data$time_index  # Full time index
+  week_effect <- 7      # Assume week effect is constant across all days
+  
+  # Call the `ps_single_incidence` function to calculate the posterior distribution
+  prediction_df <- ps_single_incidence(
+    ps_fit = cov_fit,
+    X = X,
+    num_days = length(X),
+    time_labels = data$date,
+    days_per_knot = days_per_knot,
+    spline_degree = spline_degree
+  )
+  
+  return(prediction_df)
+}
+
+```
+
+```{r}
+overall_model_path <- "/Users/minhquan/Desktop/Vacation Project/fitted_stan_models/cov_fit-overall_without_DOW.rds"
+
+# Call the function for the overall model without DOW effect
+overall_predictions_without_dow <- generate_sampled_predictions_overall_without_dow(
+  cov_fit_path = overall_model_path,
+  data = data,
+  days_per_knot = 5,
+  spline_degree = 3
+)
+
+# View the predictions
+print(overall_predictions_without_dow)
+```
+
+```{r}
+source('/Users/minhquan/Desktop/Vacation Project/ps_single_analysis_scripts.R')
+
+generate_sampled_predictions_without_dow <- function(model_weekday, data, days_per_knot = 5, spline_degree = 3) {
+  # Format the model weekday to match the file naming convention
+  model_weekday <- format(as.Date(model_weekday), "%Y-%m-%d")
+  
+  # Construct the model path for models without DOW
+  model_path <- paste0('/Users/minhquan/Desktop/Vacation Project/fitted_stan_models/without_DOW/', model_weekday, '-cov_fit.rds')
+  
+  # Load the trained Stan model
+  ps_fit <- readRDS(model_path)
+  
+  # Define the training period for the model (365 days)
+  max_training_date <- as.Date(model_weekday)
+  min_training_date <- max_training_date - 364
+  
+  # Subset `data` for the core training range (365 days)
+  core_training_data <- data[data$date >= min_training_date & data$date <= max_training_date, ]
+  core_training_data$time_index <- as.numeric(core_training_data$date) - min(as.numeric(core_training_data$date)) + 1
+  
+  # Define `X` as the time index of the core training range
+  X <- core_training_data$time_index
+  
+  # Call the `ps_single_incidence` function with restricted `num_days`
+  prediction_results <- ps_single_incidence(
+    ps_fit = ps_fit,
+    X = X,# Restrict to 365 days
+    time_labels = core_training_data$date,
+    days_per_knot = days_per_knot,
+    spline_degree = spline_degree
+  )
+  
+  return(prediction_results)
+}
+
+
+```
+
+
+
+Check for real-time model without dow effect
+```{r}
+# Example usage of the function
+model_date <- "2024-8-18"
+
+predictions_without_dow <- generate_sampled_predictions_without_dow(
+  model_weekday = model_date,
+  data = data,
+  days_per_knot = 5,
+  spline_degree = 3
+)
+
+# View the predictions
+print(predictions_without_dow)
+
+```
+
+
+```{r}
+
+# Function to compute KL Divergence for 8 days without DOW
+compare_kl_divergence_continuous_without_dow <- function(model_date, overall_model_path, data, days_per_knot = 5, spline_degree = 3) {
+
+  model_date <- as.Date(model_date)
+  
+  # Get predictions for the real-time model without DOW
+  rt_predictions <- generate_sampled_predictions_without_dow(
+    model_weekday = model_date,
+    data = data,
+    days_per_knot = days_per_knot,
+    spline_degree = spline_degree
+  )
+
+  # Get predictions for the overall model without DOW
+  overall_predictions <- generate_sampled_predictions_overall_without_dow(
+    cov_fit_path = overall_model_path,
+    data = data,
+    days_per_knot = days_per_knot,
+    spline_degree = spline_degree
+  )
+  
+  # Define the 8-day range
+  last_8_days <- seq(model_date - 7, model_date, by = "1 day")
+  
+  # Filter predictions for the last 8 days
+  rt_last_8 <- rt_predictions[rt_predictions$time %in% last_8_days, ]
+  overall_last_8 <- overall_predictions[overall_predictions$time %in% last_8_days, ]
+  
+
+  # Initialize a data frame to store KL divergence
+  kl_results <- data.frame(
+    date = last_8_days,
+    kl_divergence = rep(NA, length(last_8_days))
+  )
+  
+  # Helper function to create PDF
+  create_pdf <- function(mean, lb95, ub95, n = 1000) {
+    lb95 <- as.numeric(lb95)
+    ub95 <- as.numeric(ub95)
+    mean <- as.numeric(mean)
+    
+    x_vals <- seq(lb95, ub95, length.out = n)
+    std_dev <- (ub95 - lb95) / 4  
+    pdf_vals <- dnorm(x_vals, mean = mean, sd = std_dev)
+    pdf_vals / sum(pdf_vals)  # Normalize PDF
+  }
+
+  # Compute KL divergence for each date
+  for (i in seq_along(last_8_days)) {
+    rt_row <- rt_last_8[rt_last_8$time == last_8_days[i], ]
+    overall_row <- overall_last_8[overall_last_8$time == last_8_days[i], ]
+
+    rt_pdf <- create_pdf(rt_row$y, rt_row$lb_95, rt_row$ub_95)
+    overall_pdf <- create_pdf(overall_row$y, overall_row$lb_95, overall_row$ub_95)
+    
+    # Compute KL divergence
+    kl_div <- sum(rt_pdf * log(rt_pdf / overall_pdf), na.rm = TRUE)
+    kl_results$kl_divergence[i] <- kl_div
+  }
+  
+  # Return KL divergence results
+  return(kl_results)
+}
+
+# Function to compute KL Divergence for multiple models without DOW
+compare_kl_divergence_multiple_models_without_dow <- function(start_date, end_date, overall_model_path, data, days_per_knot = 5, spline_degree = 3) {
+  # Generate a sequence of model dates
+  model_dates <- seq(as.Date(start_date), as.Date(end_date), by = "1 day")
+  
+  # Initialize an empty list to store KL divergence results for each model
+  kl_results_list <- list()
+  
+  # Loop through each model date and compute KL divergence
+  for (model_date in model_dates) {
+    cat("Processing model date:", model_date, "\n")
+    kl_results <- compare_kl_divergence_continuous_without_dow(
+      model_date = model_date,
+      overall_model_path = overall_model_path,
+      data = data,
+      days_per_knot = days_per_knot,
+      spline_degree = spline_degree
+    )
+    # Add KL divergence results to the list
+    kl_results_list[[as.character(model_date)]] <- kl_results$kl_divergence
+  }
+  
+  # Combine all KL divergence results into a data frame
+  kl_df <- do.call(cbind, kl_results_list)
+  
+  # Convert to data frame and add the row index
+  kl_df <- as.data.frame(kl_df)
+  kl_df$Index <- 1:8
+  
+  # Reorder columns to have Index as the first column
+  kl_df <- kl_df[, c("Index", colnames(kl_df)[-ncol(kl_df)])]
+  
+  # Rename columns for clarity
+  colnames(kl_df) <- c("Index", as.character(model_dates))
+  
+  return(kl_df)
+}
+
+```
+
+
+```{r}
+# Define input parameters
+start_date <- as.Date("2024-6-1")
+end_date <- as.Date("2024-11-30")
+overall_model_path <- "/Users/minhquan/Desktop/Vacation Project/fitted_stan_models/cov_fit-overall_without_DOW.rds"
+
+# Call the function to compute KL Divergence
+kl_df_without_dow <- compare_kl_divergence_multiple_models_without_dow(
+  start_date = start_date,
+  end_date = end_date,
+  overall_model_path = overall_model_path,
+  data = data,  # Ensure `data` is loaded and prepared
+  days_per_knot = 5,
+  spline_degree = 3
+)
+```
+
+```{r}
+kl_df
+```
+
+
+```{r}
+kl_df
+```
+
+
+Model 2: with all day DOW + update model every 7 days , 365 days of training
+
+```{r}
+process_model_dow <- function(
+  max_date,
+  training_length = 365,
+  base_dir = "/Users/minhquan/Desktop/Vacation Project/fitted_stan_models/with_DOW_all_day/",
+  days_per_knot = 5,
+  spline_degree = 3,
+  iter = 5000,
+  warmup = 1000,
+  chains = 4
+) {
+  
+  max_date <- as.Date(max_date)
+  
+  
+  
+  # Compile the Stan model
+  ps_single_mod <- stan_model('/Users/minhquan/Desktop/Vacation Project/ps_single_final.stan')
+  
+  # Define the training period
+  min_date <- max_date - training_length + 1
+  core_max_date <- max_date
+  
+  
+  # Filter df_tmp for the training period
+  df_tmp <- data[data$date >= min_date & data$date <= core_max_date, ]
+  
+  # Create a time index for the core training range
+  df_tmp$time_index <- as.numeric(df_tmp$date) - min(as.numeric(df_tmp$date)) + 1
+  
+  # Calculate knots for splines
+  knots <- get_knots(df_tmp$time_index, days_per_knot = days_per_knot, spline_degree = spline_degree)
+  
+  # Prepare data for Stan
+  tmp_data <- list(
+    num_data = nrow(df_tmp),
+    num_knots = length(knots),
+    knots = knots,
+    spline_degree = spline_degree,
+    Y = df_tmp$metric_value,  
+    X = df_tmp$time_index,
+    week_effect = 7,  # Include DOW effect
+    DOW = df_tmp$DOW
+  )
+  
+  # Fit the model for the current window
+  tmp_fit <- try({
+    sampling(
+      ps_single_mod,
+      iter = iter,
+      warmup = warmup,
+      chains = chains,
+      data = tmp_data
+    )
+  }, silent = TRUE)
+  
+  # Save the fitted model
+  saveRDS(
+    tmp_fit,
+    file = paste0(base_dir, format(max_date, "%Y-%m-%d"), "-cov_fit.rds")
+  )
+  
+  # Print success message
+  message <- paste("Model for max_date", as.character(format(max_date, "%Y-%m-%d")), "processed and saved.\n")
+  cat(message)
+}
+```
+
+
+Already have the model, don't run this again (:
+
+```{r}
+
+start_date <- as.Date("2024-8-18")
+end_date <- as.Date("2024-8-18")
+max_dates <- seq.Date(from = start_date, to = end_date, by = "1 day")
+
+for (max_date in max_dates) {
+  process_model_dow(
+    max_date = max_date,
+    training_length = 365,
+    base_dir = "/Users/minhquan/Desktop/Vacation Project/fitted_stan_models/with_DOW_all_day/"
+  )
+}
+
+```
+
+
+Function to generate sample from the posterior distribution of overall dow effect for any specific day
+
+```{r}
+source('/Users/minhquan/Desktop/Vacation Project/ps_single_analysis_scripts.R')
+generate_sampled_predictions_overall <- function(cov_fit_path, data, days_per_knot = 5, spline_degree = 3, n_samples = 1000) {
+  # Load the trained Stan model
+  cov_fit <- readRDS(cov_fit_path)
+  
+  # Ensure the target_date is in Date format
+  target_date <- as.Date(target_date)
+  
+  # Extract the time index for the target date
+  target_time_index <- data$time_index[data$date == target_date]
+  
+  # Generate predictions using `ps_single_incidence_dow
+  
+  # Prepare required parameters
+  X <- data$time_index  # Full time index
+  DOW <- data$DOW       # Day of the week for the dataset
+  week_effect <- 7      # 7 days in a week
+  
+  # Call the existing function to calculate the posterior distribution
+  prediction_df <- ps_single_incidence_dow(
+    ps_fit = cov_fit,
+    X = X,
+    DOW = DOW,
+    week_effect = week_effect,
+    num_days = length(X),
+    time_labels = data$date,
+    days_per_knot = days_per_knot,
+    spline_degree = spline_degree
+  )
+  
+  return(prediction_df)
+}
+
+
+
+```
+
+Function to generate sampled predictions from the posterior distribution of a specific model for a given target date.
+
+```{r}
+source('/Users/minhquan/Desktop/Vacation Project/ps_single_analysis_scripts.R')
+generate_sampled_predictions <- function(model_weekday, data, days_per_knot = 5, spline_degree = 3) {
+  # Format the model weekday to match the file naming convention
+  model_weekday <- format(as.Date(model_weekday), "%Y-%m-%d")
+  
+  # Construct the model path for models with DOW
+  model_path <- paste0('/Users/minhquan/Desktop/Vacation Project/fitted_stan_models/with_DOW_all_day/', model_weekday, '-cov_fit.rds')
+  
+  # Load the trained Stan model
+  ps_fit <- readRDS(model_path)
+  
+  # Define the training period for the model (365 days)
+  max_training_date <- as.Date(model_weekday)
+  min_training_date <- max_training_date - 364
+  
+  # Subset `data` for the core training range (365 days)
+  core_training_data <- data[data$date >= min_training_date & data$date <= max_training_date,]
+  
+  
+  # Create a time index for the core training range
+  core_training_data$time_index <- as.numeric(core_training_data$date) - min(as.numeric(core_training_data$date)) + 1
+  
+  # Define `X` as the time index of the core training range
+  X <- core_training_data$time_index
+  
+  # Call the `ps_single_incidence_dow` function with restricted `num_days`
+  prediction_results <- ps_single_incidence_dow(
+    ps_fit = ps_fit,
+    X = X,
+    DOW = core_training_data$DOW,   # Include DOW values
+    week_effect = 7,
+    num_days = length(X),  # Restrict to 365 days
+    time_labels = core_training_data$date,
+    days_per_knot = days_per_knot,
+    spline_degree = spline_degree
+  )
+  
+  return(prediction_results)
+}
+
+```
+
+Check for overall model with dow effect
+```{r}
+# Define the path to the overall model
+overall_model_path <- "/Users/minhquan/Desktop/Vacation Project/fitted_stan_models/cov_fit-overall_with_DOW_all_day.rds"
+
+
+# Call the function with the appropriate arguments
+sampled_predictions_overall <- generate_sampled_predictions_overall(
+  cov_fit_path = overall_model_path,  
+  data = data,                       
+  days_per_knot = 5,                 
+  spline_degree = 3,                
+  n_samples = 1000                  
+)
+
+# Print a summary of the sampled predictions
+sampled_predictions_overall
+
+```
+
+
+
+Check for 1 day for real-time model with dow effect
+```{r}
+source('/Users/minhquan/Desktop/Vacation Project/ps_single_analysis_scripts.R')
+model_date <- "2024-8-18"
+
+
+sampled_predictions <- generate_sampled_predictions(
+  model_weekday = model_date,
+  data = data,  
+  days_per_knot = 5,
+  spline_degree = 3
+)
+
+print(sampled_predictions)
+
+
+```
+
+
+Compute KL divergence
+
+```{r}
+compare_kl_divergence_continuous <- function(model_date, overall_model_path, data, days_per_knot = 5, spline_degree = 3) {
+  # Convert model_date to Date object
+  model_date <- as.Date(model_date)
+  
+  # Get predictions for the real-time model
+  rt_predictions <- generate_sampled_predictions(
+    model_weekday = model_date,
+    data = data,
+    days_per_knot = days_per_knot,
+    spline_degree = spline_degree
+  )
+
+  # Get predictions for the overall model
+  overall_predictions <- generate_sampled_predictions_overall(
+    cov_fit_path = overall_model_path,
+    data = data,
+    days_per_knot = days_per_knot,
+    spline_degree = spline_degree
+  )
+  
+  # Define the 8-day range
+  last_8_days <- seq(model_date - 7, model_date, by = "1 day")
+  
+  # Filter predictions for the last 8 days
+  rt_last_8 <- rt_predictions[rt_predictions$time %in% last_8_days, ]
+  overall_last_8 <- overall_predictions[overall_predictions$time %in% last_8_days, ]
+  
+ 
+  # Initialize a data frame to store KL divergence
+  kl_results <- data.frame(
+    date = last_8_days,
+    kl_divergence = rep(NA, length(last_8_days))
+  )
+  
+  # Helper function to create PDF
+  create_pdf <- function(mean, lb95, ub95, n = 1000) {
+    lb95 <- as.numeric(lb95)
+    ub95 <- as.numeric(ub95)
+    mean <- as.numeric(mean)
+    
+    x_vals <- seq(lb95, ub95, length.out = n)
+    std_dev <- (ub95 - lb95) / 4  # Approximation using 95% CI
+    pdf_vals <- dnorm(x_vals, mean = mean, sd = std_dev)
+    pdf_vals / sum(pdf_vals)  # Normalize PDF
+  }
+
+  # Compute KL divergence for each date
+  for (i in seq_along(last_8_days)) {
+    rt_row <- rt_last_8[rt_last_8$time == last_8_days[i], ]
+    overall_row <- overall_last_8[overall_last_8$time == last_8_days[i], ]
+    
+    rt_pdf <- create_pdf(rt_row$y, rt_row$lb_95, rt_row$ub_95)
+    overall_pdf <- create_pdf(overall_row$y, overall_row$lb_95, overall_row$ub_95)
+    
+    # Compute KL divergence
+    kl_div <- sum(rt_pdf * log(rt_pdf / overall_pdf), na.rm = TRUE)
+    kl_results$kl_divergence[i] <- kl_div
+  }
+  
+  # Return KL divergence results
+  return(kl_results)
+}
+
+
+```
+
+```{r}
+# Compute KL Divergence for Multiple Models and Return as Data Frame
+compare_kl_divergence_multiple_models <- function(start_date, end_date, overall_model_path, data, days_per_knot = 5, spline_degree = 3) {
+  # Generate a sequence of model dates
+  model_dates <- seq(as.Date(start_date), as.Date(end_date), by = "1 day")
+  
+  # Initialize an empty list to store KL divergence results for each model
+  kl_results_list <- list()
+  
+  # Loop through each model date and compute KL divergence
+  for (model_date in model_dates) {
+    cat("Processing model date:", model_date, "\n")
+    kl_results <- compare_kl_divergence_continuous(
+      model_date = model_date,
+      overall_model_path = overall_model_path,
+      data = data,
+      days_per_knot = days_per_knot,
+      spline_degree = spline_degree
+    )
+    # Add KL divergence results to the list
+    kl_results_list[[as.character(model_date)]] <- kl_results$kl_divergence
+  }
+  
+  # Combine all KL divergence results into a data frame
+  kl_df <- do.call(cbind, kl_results_list)
+  
+  # Convert to data frame and add the row index
+  kl_df <- as.data.frame(kl_df)
+  kl_df$Index <- 1:8
+  
+  # Reorder columns to have Index as the first column
+  kl_df <- kl_df[, c("Index", colnames(kl_df)[-ncol(kl_df)])]
+  
+  # Rename columns for clarity
+  colnames(kl_df) <- c("Index", as.character(model_dates))
+  
+  return(kl_df)
+}
+
+```
+
+```{r}
+start_date <- "2024-6-1"
+end_date <- "2024-11-30"
+overall_model_path <- "/Users/minhquan/Desktop/Vacation Project/fitted_stan_models/cov_fit-overall_with_DOW_all_day.rds"
+
+kl_df <- compare_kl_divergence_multiple_models(
+  start_date = start_date,
+  end_date = end_date,
+  overall_model_path = overall_model_path,
+  data = data
+)
+
+# Print KL divergence data frame
+print(kl_df)
+```
+
+```{r}
+# Combine all KL divergence values from both data frames
+kl_values_without_dow <- unlist(kl_df_without_dow[, -1], use.names = FALSE)  
+kl_values_with_dow <- unlist(kl_df[, -1], use.names = FALSE)  
+# Compute the global min and max for the color scale
+global_min <- min(c(kl_values_without_dow, kl_values_with_dow), na.rm = TRUE)
+global_max <- max(c(kl_values_without_dow, kl_values_with_dow), na.rm = TRUE)
+# Melt the data frame for ggplot2 (Without DOW Effect)
+kl_melted_without_dow <- melt(kl_df_without_dow, id.vars = "Index", variable.name = "Model_Date", value.name = "KL_Divergence")
+kl_melted_with_dow <- melt(kl_df, id.vars = "Index", variable.name = "Model_Date", value.name = "KL_Divergence")
+# Ensure Model_Date is in Date format
+kl_melted_without_dow$Model_Date <- as.Date(kl_melted_without_dow$Model_Date)
+kl_melted_with_dow$Model_Date <- as.Date(kl_melted_with_dow$Model_Date)
+```
+
+```{r}
+kl_melted_with_dow
+```
+
+
+Heatmap without DOW (single)
+```{r}
+
+
+heatmap_without_dow <- ggplot(kl_melted_without_dow, aes(x = Model_Date, y = Index, fill = KL_Divergence)) +
+  geom_tile(color = "black", size = 0.05) +  
+  scale_fill_gradient(
+    low = "yellow", high = "red", name = "KL Divergence", 
+    limits = c(global_min, global_max)  
+  ) +
+  scale_x_date(
+    breaks = "1 month",
+    date_labels = "%d/%m"
+  ) +
+  scale_y_continuous(
+    breaks = c(1, 7),
+    labels = c(1, 7)
+  ) +
+  labs(
+    title = "KL Divergence Heatmap Without DOW Effect",
+    x = "Model Date",
+    y = "Days Relative to Model Date"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 18, margin = margin(r = -80)),
+    axis.text.y = element_text(size = 14, margin = margin(r = -10)),
+    axis.title = element_text(size = 20),
+    plot.title = element_text(size = 18, face = "bold"),
+    legend.title = element_text(size = 14, margin = margin(b = 5)),  # Add margin below the title
+    legend.text = element_text(size = 12),  # Adjust legend text size
+    legend.key.size = unit(1.8, "cm"),  # Increase key size for better spacing
+    legend.spacing.x = unit(0.3, "cm"),  # Adjust key-to-key spacing
+    legend.box.margin = margin(t = -20, r = 0, b = 0, l = 0),  # Move legend box closer (negative top margin)
+    legend.margin = margin(t = -10, r = 0, b = 0, l = 0),  # Move legend elements closer to graph
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.margin = margin(t = 5, r = 5, b = 5, l = 5)  # Add spacing for the plot
+  )
+
+# Print the heatmap
+heatmap_without_dow
+
+
+
+```
+
+
+Heatmap with dow (single)
+```{r}
+# Ensure Model_Date is in Date format
+kl_melted_with_dow$Model_Date <- as.Date(kl_melted_with_dow$Model_Date)
+
+
+# Plot the heatmap (With DOW Effect)
+heatmap_with_dow <- ggplot(kl_melted_with_dow, aes(x = Model_Date, y = Index, fill = KL_Divergence)) +
+  geom_tile(color = "black", size = 0.05) +  # Add black borders for better separation
+  scale_fill_gradient(
+    low = "yellow", high = "red", name = "KL Divergence", 
+    limits = c(global_min, global_max)  
+  ) +
+  scale_x_date(
+    breaks = "1 month",  # Same date breaks as the previous heatmap
+  ) +
+  scale_y_continuous(
+    breaks = c(1, 7),
+    labels = c(1, 7)
+  ) +
+  labs(
+    title = "KL Divergence Heatmap With DOW Effect",
+    x = "Model Date",
+    y = "Days Relative to Model Date"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 18, margin = margin(r = -50)),
+    axis.text.y = element_text(size = 14, margin = margin(r = -10)),
+    axis.title = element_text(size = 20),
+    plot.title = element_text(size = 18, face = "bold"),
+    legend.title = element_text(size = 14, margin = margin(b = 5)),  # Add margin below the title
+    legend.text = element_text(size = 12),  # Adjust legend text size
+    legend.key.size = unit(1.8, "cm"),  # Increase key size for better spacing
+    legend.spacing.x = unit(0.3, "cm"),  # Adjust key-to-key spacing
+    legend.box.margin = margin(t = -10, r = 0, b = 0, l = 0),  # Move legend box closer to the graph
+    legend.margin = margin(t = -10, r = 0, b = 0, l = 0),  # Move legend elements closer to the graph
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.margin = margin(t = 5, r = 5, b = 5, l = 5)  # Add spacing for the plot
+  )
+heatmap_with_dow
+
+```
+
+```{r}
+kl_melted_without_dow
+```
+
+
+
+Combine two heat map (poster)
+```{r}
+
+# Add a column to indicate DOW effect status
+kl_melted_without_dow$DOW_Effect <- "Model Without Day of Week Effect"
+kl_melted_with_dow$DOW_Effect <- "Model With Day of Week Effect"
+
+# Combine the two datasets
+kl_combined <- rbind(kl_melted_without_dow, kl_melted_with_dow)
+
+
+```
+
+
+```{r}
+# Transform the Index values to map 8 -> 0, 7 -> 1, ..., 1 -> 7
+kl_combined <- kl_combined %>%
+  mutate(Index = 8 - Index)  # Subtract Index from 8 to flip the order
+
+# Create the combined heatmap
+combined_heatmap <- ggplot(kl_combined, aes(x = Model_Date, y = Index, fill = KL_Divergence)) +
+  geom_tile(color = "black", size = 0.1) +  
+  scale_fill_distiller(
+  palette = "YlGnBu",
+  direction = 1,  # Keeps the light-to-dark gradient
+  name = "KL \nDivergence",
+  limits = c(global_min, global_max)
+  ) +
+  scale_x_date(
+    date_breaks = "1 month",        # Set the breaks to monthly intervals
+    date_labels = "%b "             # Format the labels as "Month Year" (e.g., Nov 2024)
+  ) +
+  scale_y_continuous(
+    breaks = c(0, 2, 4, 6),  # Specify the breaks at positions 0, 2, 4, 6
+    labels = c(0, 2, 4, 6)   # Labels to display at those positions
+  ) +
+  labs(
+    title = "",
+    x = "",
+    y = "Days Relative to Model Date"
+  ) +
+  facet_wrap(~DOW_Effect, ncol = 1, scales = "free_y") +  # Create separate panels
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(hjust = 0.4, size = 28, margin = margin(r = -50)),
+    axis.text.y = element_text(size = 28, margin = margin(r = -50)),
+    axis.title.y = element_text(size = 28, margin = margin(r = 20)),
+    axis.title = element_text(size = 28),
+    strip.text = element_text(size = 28, face = "bold"),
+    legend.title = element_text(size = 24, margin = margin(b = 20), hjust = 0.5, vjust = 0.5),  # Center legend title
+    legend.text = element_text(size = 20),  
+    legend.key.size = unit(2, "cm"),  # Increase key size for better spacing
+    legend.spacing.x = unit(0.3, "cm"),  # Adjust key-to-key spacing
+    legend.box.margin = margin(t = -10, r = 0, b = 0, l = 0),  # Move legend box closer to the graph
+    legend.margin = margin(t = -10, r = 0, b = 0, l = 0),  # Move legend elements closer to the graph
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA),  # Set the panel background to white
+    plot.background = element_rect(fill = "white", color = NA),  # Set the plot background to white
+    plot.margin = margin(t = 10, r = 10, b = 10, l = 10),  # Add spacing for the plot
+    coord_cartesian(clip = "off")  
+
+  )
+```
+
+
+
+
+
+```{r}
+ggsave(
+  filename = "combined_heatmap.pdf",   # File name
+  plot = combined_heatmap,            # The plot object
+  width = 20,                         # Width of the output image (in inches)
+  height = 10,                        # Height of the output image (in inches)
+  dpi = 500                           # Resolution (dots per inch)
+)
+
+
+```
+
+
+```{r}
+data
+```
+
+
+
+```{r}
+
+
+filtered_data <- data %>%
+  filter(date >= as.Date("2024-06-01") & date <= as.Date("2024-12-01"))
+
+# Plot the data
+ggplot(filtered_data, aes(x = date, y = metric_value)) +
+  geom_line(color = "red", size = 1) +  # Connect points with a red line
+  geom_point(color = "red", size = 1) +  # Add red points for visibility
+  scale_x_date(
+    date_breaks = "1 month",  
+    date_labels = "%b",
+    expand = c(0, 0),  
+    limits = c(as.Date("2024-06-01"), as.Date("2024-12-01"))  # ❌ Removed extra `+`
+  ) +  # ✅ Added `+` here to continue the ggplot chain
+  labs(
+    x = "",
+    y = "Number of Cases",
+    title = ""
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(
+    axis.text.x = element_text(vjust = 1.2, hjust = 0.6, size = 32, margin = margin(t = 20)),  # Add margin to shift labels inward
+    axis.text.y = element_text(size = 36),
+    axis.title = element_text(size = 32),
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA),  
+    plot.background = element_rect(fill = "white", color = NA), 
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1.5),
+    plot.margin = margin(t = 3, r = 50, b = 3, l = 50)
+  )
+
+
+
+```
+```{r}
+# Make sure the plot is the last one created
+ggsave("heatmap_count.pdf", width = 22, height = 5, dpi = 800)
+
+```
+
+
+
+
+
+
+Visualise the prediction of the real-time model daily witout dow effect (Figure 3 Poster)
+
+```{r}
+# Function to collect predictions for a model (without DOW effect)
+collect_predictions_without_dow <- function(model_date, data, days_per_knot = 5, spline_degree = 3) {
+  
+  model_date = as.Date(model_date)
+  # Generate predictions using the model (without DOW effect)
+  predictions <- generate_sampled_predictions_without_dow(
+    model_weekday = model_date,
+    data = data,
+    days_per_knot = days_per_knot,
+    spline_degree = spline_degree
+  )
+
+  # Define the prediction range (2 days before the model date)
+  model_date <- as.Date(model_date)
+  prediction_start_date <- model_date - 1
+  prediction_end_date <- model_date 
+
+  # Filter predictions for the range
+  predictions_filtered <- predictions %>%
+    filter(time >= prediction_start_date & time <= prediction_end_date)
+
+  # Add the model date as a label
+  predictions_filtered <- predictions_filtered %>%
+    mutate(model_date = model_date)
+
+  # Filter actual data for the same range
+  actual_data_filtered <- data %>%
+    filter(date >= prediction_start_date & date <= prediction_end_date)
+
+  list(predictions = predictions_filtered, actual = actual_data_filtered)
+}
+
+# Loop through consecutive model dates and collect predictions (without DOW effect)
+start_model_date <- as.Date("2024-10-20")
+end_model_date <- as.Date("2024-11-17")
+
+model_dates <- seq(start_model_date, end_model_date, by = "1 day")
+
+all_predictions <- list()
+all_actuals <- list()
+
+for (model_date in model_dates) {
+  result <- collect_predictions_without_dow(model_date, data)
+  all_predictions[[as.character(model_date)]] <- result$predictions
+  all_actuals[[as.character(model_date)]] <- result$actual
+}
+
+# Combine all predictions and actual data into single data frames
+combined_predictions <- bind_rows(all_predictions)
+combined_actuals <- bind_rows(all_actuals)
+
+
+
+```
+
+```{r}
+# Define colors for the weekdays
+weekday_colors <- c(
+  "Monday" = "blue", "Tuesday" = "red", "Wednesday" = "green",
+  "Thursday" = "purple", "Friday" = "orange",
+  "Saturday" = "pink", "Sunday" = "cyan"
+)
+
+# Add a weekday column to the combined_predictions dataframe
+combined_predictions <- combined_predictions %>%
+  mutate(weekday = weekdays(as.Date(time)))  
+
+# Add a weekday column to the combined_actuals dataframe
+combined_actuals <- combined_actuals %>%
+  mutate(weekday = weekdays(as.Date(date)))  # Use `date` for actuals
+
+# Update `combined_predictions` to map `weekday` to `model_date`
+combined_predictions <- combined_predictions %>%
+  mutate(weekday_fill = weekdays(as.Date(model_date)))  # Map `weekday` to `model_date`
+```
+
+
+With DOW effect, but without dow simplex to see the smooth trend
+
+```{r}
+# Function to collect smoothed trend (excluding simplex weighting) for each model
+collect_smoothed_trend <- function(model_date, days_per_knot = 5, spline_degree = 3) {
+  # Path to the Stan model file
+  model_path <- paste0("/Users/minhquan/Desktop/Vacation Project/fitted_stan_models/with_DOW_all_day/",
+                       format(as.Date(model_date), "%Y-%m-%d"), "-cov_fit.rds")
+  
+  # Read the Stan model file
+  stan_model <- readRDS(model_path)
+ 
+  # Extract the smoothed trend parameters (a_new)
+  smoothed_trend <- rstan::extract(stan_model, pars = "a_new")$a_new
+
+  # Transform to the natural scale (exp(a_new))
+  smoothed_trend_natural <- exp(apply(smoothed_trend, 2, mean))  # Posterior mean for smoothed trend
+  lower_bound <- exp(apply(smoothed_trend, 2, quantile, probs = 0.025))  # 2.5% credible interval
+  upper_bound <- exp(apply(smoothed_trend, 2, quantile, probs = 0.975))  # 97.5% credible interval
+  
+  # Define the range for this model (two days: model_date and model_date - 1)
+  prediction_start_date <- as.Date(model_date) - 1
+  prediction_end_date <- as.Date(model_date)
+  
+  # Generate time indices
+  time_indices <- seq(from = prediction_start_date, to = prediction_end_date, by = "1 day")
+  
+  # Subset the smoothed trend for two days
+  indices_to_keep <- (length(smoothed_trend_natural) - 1):length(smoothed_trend_natural)
+  smoothed_trend_natural <- smoothed_trend_natural[indices_to_keep]
+  lower_bound <- lower_bound[indices_to_keep]
+  upper_bound <- upper_bound[indices_to_keep]
+  
+  # Create a data frame for this model
+  data.frame(
+    time = time_indices,
+    smoothed_trend = smoothed_trend_natural,
+    lower_bound = lower_bound,
+    upper_bound = upper_bound,
+    model_date = as.Date(model_date)
+  )
+}
+
+# Loop through consecutive model dates and collect smoothed trends
+start_model_date <- as.Date("2024-10-20")
+end_model_date <- as.Date("2024-11-17")  
+
+model_dates <- seq(start_model_date, end_model_date, by = "1 day")
+all_smoothed_trends <- list()
+
+for (model_date in model_dates) {
+  smoothed_trend_data <- collect_smoothed_trend(model_date)
+  all_smoothed_trends[[as.character(model_date)]] <- smoothed_trend_data
+}
+
+# Combine all trends into a single data frame
+combined_smoothed_trends <- bind_rows(all_smoothed_trends)
+
+# Add a column to represent the weekday of the last date (model_date) for coloring
+combined_smoothed_trends <- combined_smoothed_trends %>%
+  mutate(weekday_fill = weekdays(as.Date(model_date)))  # Use the weekday of model_date
+
+```
+
+
+```{r}
+# Load the model with DOW effect
+model_with_dow <- readRDS("/Users/minhquan/Desktop/Vacation Project/fitted_stan_models/cov_fit-overall_with_DOW_all_day.rds")
+
+# Extract the smoothed trend parameters (a_new) for the model with DOW effect
+smoothed_trend <- rstan::extract(stan_model, pars = "a_new")$a_new
+
+# Transform to the natural scale (exp(a_new))
+smoothed_trend_natural_with_dow <- exp(apply(smoothed_trend_with_dow, 2, mean))  # Posterior mean
+lower_bound_with_dow <- exp(apply(smoothed_trend_with_dow, 2, quantile, probs = 0.025))  # 2.5% credible interval
+upper_bound_with_dow <- exp(apply(smoothed_trend_with_dow, 2, quantile, probs = 0.975))  # 97.5% credible interval
+
+
+# Create a data frame for the smoothed trend with DOW effect
+plot_data_with_dow <- data.frame(
+  time = seq(from = as.Date("2023-6-01"), by = "1 day", length.out = length(smoothed_trend_natural_with_dow)),
+  y = smoothed_trend_natural_with_dow,
+  lb_95 = lower_bound_with_dow,
+  ub_95 = upper_bound_with_dow
+)
+
+
+```
+
+
+```{r}
+overall_model_path <- "/Users/minhquan/Desktop/Vacation Project/fitted_stan_models/cov_fit-overall_without_DOW.rds"
+
+# Call the function for the overall model without DOW effect
+overall_predictions_without_dow <- generate_sampled_predictions_overall_without_dow(
+  cov_fit_path = overall_model_path,
+  data = data,
+  days_per_knot = 5,
+  spline_degree = 3
+)
+
+# View the predictions
+print(overall_predictions_without_dow)
+```
+
+
+
+```{r}
+# Filter the data for the specific date range
+plot_data_with_dow <- plot_data_with_dow %>%
+  filter(time >= as.Date("2024-10-19") & time <= as.Date("2024-11-17"))
+
+overall_predictions_without_dow <- overall_predictions_without_dow %>%
+  filter(time >= as.Date("2024-10-19") & time <= as.Date("2024-11-17"))
+```
+
+
+
+```{r}
+
+print(combined_predictions) # real-time prediction without dow
+
+print(overall_predictions_without_dow) # #overall model without dow
+
+print(combined_smoothed_trends) # real-time prediction with dow
+
+print(plot_data_with_dow) # overall model with dow
+```
+
+
+
+
+Combine real-time model of without DOW and with DOW (facet)
+
+
+```{r}
+
+# Add FacetGroup variable to distinguish between real-time and smoothed trends
+combined_predictions <- combined_predictions %>%
+  mutate(FacetGroup = "Model Not Incorporating the Day-of-Week Effect")
+
+combined_smoothed_trends <- combined_smoothed_trends %>%
+  mutate(FacetGroup = "Model Incorporating the Day-of-Week Effect")
+
+overall_predictions_without_dow <- overall_predictions_without_dow %>%
+  mutate(FacetGroup = "Model Not Incorporating the Day-of-Week Effect")
+
+plot_data_with_dow <- plot_data_with_dow %>%
+  mutate(FacetGroup = "Model Not Incorporating the Day-of-Week Effect")
+
+# Combine datasets for predictions
+combined_data <- bind_rows(
+  combined_predictions %>%
+    select(time, y, lb_95, ub_95, FacetGroup, weekday_fill, model_date),
+  combined_smoothed_trends %>%
+    select(time, y = smoothed_trend, lb_95 = lower_bound, ub_95 = upper_bound, FacetGroup, weekday_fill, model_date)
+)
+
+combined_data <- combined_data %>%
+  mutate(weekday_fill = case_when(
+    weekday_fill == "Monday" ~ "Mon",
+    weekday_fill == "Tuesday" ~ "Tue",
+    weekday_fill == "Wednesday" ~ "Wed",
+    weekday_fill == "Thursday" ~ "Thu",
+    weekday_fill == "Friday" ~ "Fri",
+    weekday_fill == "Saturday" ~ "Sat",
+    weekday_fill == "Sunday" ~ "Sun"
+  ))
+
+# Combine overall data (for credible intervals)
+overall_data <- bind_rows(
+  overall_predictions_without_dow %>% 
+    mutate(FacetGroup = "Model Not Incorporating the Day-of-Week Effect", linetype = "Credible Interval"),
+  plot_data_with_dow %>% 
+    mutate(FacetGroup = "Model Incorporating the Day-of-Week Effect", linetype = "Credible Interval")
+)
+
+# Filter overall_data for the specified date range
+overall_data <- overall_data %>%
+  filter(time >= as.Date("2024-10-19") & time <= as.Date("2024-11-17"))
+
+```
+
+
+
+
+
+
+
+```{r}
+weekday_colors <- c(
+  "Mon" = "blue", "Tue" = "red", "Wed" = "green",
+  "Thu" = "purple", "Fri" = "orange",
+  "Sat" = "pink", "Sun" = "cyan"
+)
+
+# Define the dates for big and small ticks
+# Define the correct major (big) and minor (small) ticks
+big_ticks <- seq(as.Date("2024-10-13"), as.Date("2024-11-17"), by = "7 days")  # Every Sunday
+small_ticks <- seq(as.Date("2024-10-13"), as.Date("2024-11-17"), by = "1 day")  # Every day
+
+
+
+ggplot() +
+  # Add credible interval ribbons for real-time and smoothed trends
+  geom_ribbon(
+    data = combined_data,
+    aes(
+      x = time,
+      ymin = lb_95,
+      ymax = ub_95,
+      group = model_date,
+      fill = weekday_fill
+    ),
+    alpha = 0.3
+  ) +
+  # Add smoothed trend lines for real-time and smoothed trends
+  geom_line(
+    data = combined_data,
+    aes(
+      x = time,
+      y = y,
+      group = model_date,
+      color = weekday_fill
+    ),
+    linewidth = 1  # Use linewidth instead of size
+  ) +
+  # Add dashed lines for the credible interval of the overall models (directly in the graph)
+  geom_line(
+    data = overall_data,
+    aes(
+      x = time,
+      y = lb_95,
+      group = FacetGroup
+    ),
+    linetype = "dashed",  # Add dashed line
+    linewidth = 1,  # Use linewidth instead of size
+    color = "black"
+  ) +
+  geom_line(
+    data = overall_data,
+    aes(
+      x = time,
+      y = ub_95,
+      group = FacetGroup
+    ),
+    linetype = "dashed",  # Add dashed line
+    linewidth = 1,  # Use linewidth instead of size
+    color = "black"
+  ) +
+  # Add facet wrapping
+  facet_wrap(~FacetGroup, ncol = 1, scales = "free_y") +
+  # Customize plot labels and legend
+  labs(
+    title = "",
+    x = "",
+    y = "Number of Cases",
+    color = NULL,  # Remove "Day of Week" label for color legend
+    fill = NULL,   # Remove "Day of Week" label for fill legend
+    linetype = NULL  # Remove linetype legend
+  ) +
+  # Apply weekday colors
+  scale_color_manual(
+    values = weekday_colors,
+    breaks = c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"), 
+    labels = c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+  ) +
+  scale_fill_manual(
+    values = weekday_colors,
+    breaks = c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"), 
+    labels = c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+  ) +
+  # Add text annotation for "Overall Model Credible Interval" inside each subgraph
+  geom_text(
+    data = data.frame(
+      FacetGroup = unique(overall_data$FacetGroup),  # Ensure one label per facet
+      label = c("Credible Interval for the Overall Model Not Incorporating DOW Effects", 
+                "Credible Interval for the Overall Model Incorporating DOW Effects")
+    ),
+    aes(
+      x = as.Date("2024-11-8"),  # Adjust x position for the text
+      y = 400,  # Adjust y position for the text
+      label = label
+    ),
+    color = "black",
+    size = 7,
+    hjust = 0.5
+  ) +
+  # Add dashed lines next to the labels
+  geom_segment(
+    data = data.frame(
+      FacetGroup = unique(overall_data$FacetGroup),  # Ensure one line per facet
+      x = as.Date("2024-10-30"),  # Start of the dashed line (adjust as needed)
+      xend = as.Date("2024-10-31"),  # End of the dashed line (adjust as needed)
+      y = 400,  # y position of the dashed line (same as the text)
+      yend = 400  # y position of the dashed line (same as the text)
+    ),
+    aes(
+      x = x,
+      xend = xend,
+      y = y,
+      yend = yend
+    ),
+    linetype = "dashed",  # Dashed line
+    color = "black",
+    linewidth = 1.5  # Use linewidth instead of size
+  ) +
+  # Configure x-axis
+    scale_x_date(
+      limits = c(as.Date("2024-10-19"), as.Date("2024-11-17")),
+      breaks = big_ticks,             # Major ticks for Sundays
+      minor_breaks = small_ticks,     # Minor ticks for all other dates
+      date_labels = "%d/%m",
+      expand = c(0, 0)
+  ) + 
+  # Configure y-axis
+  scale_y_continuous(
+    limits = c(50, 550),
+    breaks = seq(100, 500, by = 200),
+    expand = c(0, 0)
+  ) +
+  # Add minimal theme
+  theme_minimal(base_size = 16) +
+  theme(
+    axis.text.x = element_text(vjust = 0.5, hjust = 0.5, size = 24),
+    axis.text.y = element_text(size = 24),
+    axis.title = element_text(size = 24),
+    strip.text = element_text(size = 24, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "top",  # Place legend at the top
+    legend.direction = "horizontal",  # Arrange legend items horizontally
+    legend.box = "horizontal",  # Ensure legend is in a single line
+    legend.key.size = unit(2, "cm"),  # Adjust legend key size
+    legend.key.width = unit(2, "cm"),  # Adjust legend key width
+    legend.spacing = unit(3.5, "cm"),  # Adjust spacing between legend items
+    legend.text = element_text(size = 22),  # Adjust legend text size
+    plot.background = element_rect(fill = "white", color = NA),
+    plot.margin = margin(t = 20, r = 20, b = 20, l = 20),
+    # Add x-axis ticks
+    axis.ticks.x = element_line(color = "black", linewidth = 1),
+    # Different lengths for major and minor ticks
+    axis.ticks.length = unit(c(0.25, 0.15), "cm"), 
+    # Add x-axis and y-axis lines
+    axis.line.x = element_line(color = "black", linewidth = 1.2),  # X-axis line
+    axis.line.y = element_line(color = "black", linewidth = 1.2),   # Y-axis line
+    panel.spacing = unit(3, "lines")  # Adjust spacing between subgraphs
+  ) +
+  # Ensure the legend is in a single line
+  guides(
+      color = guide_legend(nrow = 1, override.aes = list(size = 5)),  
+      fill = guide_legend(nrow = 1, override.aes = list(size = 5))    
+  )
+
+
+
+```
+
+
+```{r}
+# Save the plot with a taller aspect ratio
+ggsave(
+  filename = "realtime and overall.pdf",
+  plot = last_plot(),
+  width = 18,   
+  height = 12,  # Increase height to stretch the y-axis
+  dpi = 1000     # Adjust resolution
+)
+
+```
+
+
+Visualisation of KL divergence between N(2,2) and N(1,1)
+
+
+
+-----------------------------------------------------------------------------------------------------------------------------
+
+```{r}
+
+
+# Define the distributions
+p1 <- function(x) dnorm(x, mean = 3, sd = 2)  # p1(x): N(3, 2)
+p2 <- function(x) dnorm(x, mean = 2, sd = 2)  # p2(x): N(2, 2)
+q  <- function(x) dnorm(x, mean = 1, sd = 1)  # q(x): N(1, 1)
+
+# KL divergence contribution function
+kl_contribution <- function(x, p, q) {
+  px <- p(x)
+  qx <- q(x)
+  px <- ifelse(px > 0, px, 1e-10)  # Avoid log(0)
+  qx <- ifelse(qx > 0, qx, 1e-10)
+  px * log(px / qx)
+}
+
+# Integration range
+integration_range <- c(-5, 10)
+
+# Compute KL divergence values
+kl_div_p1_q <- integrate(kl_contribution, lower = integration_range[1], upper = integration_range[2], p = p1, q = q)$value
+kl_div_p2_q <- integrate(kl_contribution, lower = integration_range[1], upper = integration_range[2], p = p2, q = q)$value
+
+# Create sequences for plotting
+x_values <- seq(integration_range[1], integration_range[2], length.out = 1000)
+
+# Data for plotting
+data <- bind_rows(
+  data.frame(
+    x = x_values,
+    p = p2(x_values),  # P(x) for left subplot (N(2,2))
+    q = q(x_values),   # Q(x) always N(1,1)
+    kl = kl_contribution(x_values, p2, q),
+    Distribution = "KL(N(2, 2) || N(1, 1))",
+    fill_color = "#fc8d62"  # Orange
+  ),
+  data.frame(
+    x = x_values,
+    p = p1(x_values),  # P(x) for right subplot (N(3,2))
+    q = q(x_values),   # Q(x) always N(1,1)
+    kl = kl_contribution(x_values, p1, q),
+    Distribution = "KL(N(3, 2) || N(1, 1))",
+    fill_color = "#66c2a5"  # Teal
+  )
+)
+
+# Define KL divergence text labels
+kl_labels <- c(
+  sprintf("N(2, 2) vs N(1, 1) ", kl_div_p2_q),
+  sprintf("N(3, 2) vs N(1, 1) ", kl_div_p1_q)
+)
+names(kl_labels) <- unique(data$Distribution)
+
+# Define placement of KL divergence labels and color boxes
+kl_annotations <- data.frame(
+  x = rep(-3, 2), 
+  y = c(0.85, 0.85),  # Align both labels at the same y position
+  label = "",
+  fill_color = c("#fc8d62", "#66c2a5"),  # Orange & Teal for different facets
+  Distribution = names(kl_labels)
+)
+
+# Generate plot
+ggplot(data, aes(x)) +
+  geom_line(aes(y = p, color = "P(x)"), size = 1) +  # P(x) in blue
+  geom_line(aes(y = q, color = "Q(x)"), size = 1) +  # Q(x) in red
+  geom_area(aes(y = kl, fill = fill_color), alpha = 0.5, show.legend = FALSE) +  # KL area
+  facet_wrap(~Distribution, ncol = 2, labeller = labeller(Distribution = kl_labels)) +
+  scale_color_manual(name = NULL, values = c("P(x)" = "blue", "Q(x)" = "red")) +
+  labs(
+    title = "",
+    y = "",
+    x = ""
+  ) +
+  theme_minimal() +
+  scale_x_continuous(limits = c(-5, 10), breaks = seq(-5, 10, by = 5)) +
+  scale_y_continuous(
+  breaks = seq(0, 1, by = 0.5), 
+  limits = c(-0.25, 1),
+  labels = function(x) ifelse(x == 0, "0", format(x, nsmall = 1))  # Ensure "0" appears normally
+) +
+  theme(
+    legend.position = "none",  # Remove bottom legend
+    strip.text = element_text(size = 28),
+    text = element_text(size = 28),
+    plot.background = element_rect(color = "black", fill = NA, size = 1),
+    panel.grid = element_blank()
+  ) +
+  geom_text(data = kl_annotations, aes(x = x, y = y, label = label), 
+          size = 5, hjust = 0, color = "black", inherit.aes = FALSE) +
+  geom_rect(data = kl_annotations, aes(
+    xmin = x - 1.7,  # Move further left
+    xmax = x - 0.5,  # Keep width
+    ymin = y - 0.05, ymax = y + 0.05, fill = fill_color
+  ), inherit.aes = FALSE, show.legend = FALSE)
+
+ggsave("KL visualisation.pdf", width = 15, height = 8)
+
+
+```
+
+
